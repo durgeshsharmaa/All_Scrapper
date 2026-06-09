@@ -22,7 +22,7 @@ CPI (YoY): https://www.investing.com/economic-calendar/cpi-733
 Core CPI (MoM): https://www.investing.com/economic-calendar/united-states-core-consumer-price-index-%28cpi%29-mom-56  
 Core CPI (YoY): https://www.investing.com/economic-calendar/united-states-core-consumer-price-index-%28cpi%29-yoy-736
 
-The production fast path uses only BLS Table 1 HTML as the blocking release trigger. It polls Table 1 content every 100ms during sniper mode and emits the final JSON immediately after the expected release period and all four CPI metrics validate.
+The production fast path uses only BLS Table 1 HTML as the blocking release trigger. It polls Table 1 content every 100ms during sniper mode and emits the final JSON immediately after the expected release period and all four CPI metrics validate. After the official JSON is printed, the scraper starts post-release confirmation polling for BLS Summary, BLS PDF, BLS API, and Investing.com in parallel.
 
 The primary trigger is the BLS Table 1 HTML row data for CPI-U, U.S. city average. The scraper extracts these direct table values from the same table:
 
@@ -52,7 +52,7 @@ The PDF parser is dependency-free. It extracts readable PDF text streams and val
 
 The Investing.com source fetches the four event pages directly and parses each page's title, latest release date, actual, forecast, previous, and historical release rows. It confirms the bracketed history period, such as `(Apr)`, matches the BLS target month. Investing.com actuals are confirmation only; they never override BLS official values. If Investing.com differs from BLS, the scraper prints `INVESTING_MISMATCH`. If Investing.com has not updated to the BLS release date/period, it prints `INVESTING_NOT_UPDATED`.
 
-In sniper mode, BLS Summary, PDF, API, and Investing.com are excluded from the critical output path because they are slower and can add seconds of latency. They remain preflight/confirmation sources.
+In sniper mode, BLS Summary, PDF, API, and Investing.com are excluded from the critical output path because they are slower and can add seconds of latency. After the first official Table 1 hit, they are polled concurrently as confirmation sources and print `CONFIRMED`, `MISMATCH`, `NOT_UPDATED`, or `ERROR` with their values as they arrive.
 
 Console output prints the four-value metric line for each source that can provide the full CPI payload:
 
@@ -79,4 +79,4 @@ For an 08:30 Eastern CPI release during daylight saving time, UTC is usually 12:
 go run main.go
 ```
 
-At startup the scraper fetches current published values, displays UTC and IST event times, waits for the configured release, captures the BLS Table 1 baseline one minute before release, activates sniper mode two seconds before release, and emits immediately on the first valid BLS Table 1 hit for the expected period. If started within one minute of release, slow preflight sources are skipped automatically so they cannot delay the fast path.
+At startup the scraper fetches current published values, displays UTC and IST event times, waits for the configured release, captures the BLS Table 1 baseline one minute before release, activates sniper mode two seconds before release, and emits immediately on the first valid BLS Table 1 hit for the expected period. If started within one minute of release, slow preflight sources are skipped automatically so they cannot delay the fast path. Once official output is printed, confirmation sources continue polling in parallel until they confirm, mismatch, error, or the release polling window ends.

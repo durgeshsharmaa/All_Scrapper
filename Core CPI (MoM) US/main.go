@@ -59,16 +59,17 @@ const (
 	investingURL = "https://www.investing.com/economic-calendar/"
 	scheduleURL  = "https://www.bls.gov/cpi/"
 
-	httpTimeout        = 5 * time.Second
-	requestTimeout     = 5 * time.Second
-	fastRequestTimeout = 1500 * time.Millisecond
-	pollCadence        = 500 * time.Millisecond
-	fastPollCadence    = 100 * time.Millisecond
-	contentEveryPolls  = 5
-	testLead           = 1 * time.Minute
-	sniperLead         = 2 * time.Second
-	pollWindow         = 3 * time.Minute
-	userAgent          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 US-CPI-Table1-Sniper/1.0"
+	httpTimeout         = 5 * time.Second
+	requestTimeout      = 5 * time.Second
+	fastRequestTimeout  = 1500 * time.Millisecond
+	pollCadence         = 500 * time.Millisecond
+	fastPollCadence     = 100 * time.Millisecond
+	confirmationCadence = 1 * time.Second
+	contentEveryPolls   = 5
+	testLead            = 1 * time.Minute
+	sniperLead          = 2 * time.Second
+	pollWindow          = 3 * time.Minute
+	userAgent           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 US-CPI-Table1-Sniper/1.0"
 )
 
 type SourceType string
@@ -128,6 +129,13 @@ type SourceResult struct {
 	FirstHit *Result
 	Latest   *Result
 	Detected bool
+}
+
+type ConfirmationOutcome struct {
+	Source  string
+	Result  *Result
+	Status  string
+	Message string
 }
 
 type Scraper interface {
@@ -388,7 +396,11 @@ func main() {
 	if err := enc.Encode(confirmed); err != nil {
 		fmt.Println("NOT_CONFIRMED")
 		logger.Printf("json encode failed: %v", err)
+		return
 	}
+
+	officialHit := firstHitForSource(sourceResults, (tableScraper{}).Name())
+	runPostReleaseConfirmations(client, officialHit, eventTime, pollEnd, expectedPeriod, investingReleaseDate(eventTime), logger)
 }
 
 func valueSources() []Scraper {
@@ -403,6 +415,15 @@ func valueSources() []Scraper {
 
 func primaryValueSources() []Scraper {
 	return []Scraper{tableScraper{}}
+}
+
+func confirmationSources() []Scraper {
+	return []Scraper{
+		summaryScraper{},
+		pdfScraper{},
+		apiScraper{},
+		investingScraper{},
+	}
 }
 
 func (tableScraper) Name() string           { return "BLS CPI Table 1 HTML" }
@@ -1059,6 +1080,153 @@ func runFastPrimarySniperMode(client *http.Client, baselines map[string]*SourceR
 	}
 }
 
+func runPostReleaseConfirmations(client *http.Client, official *Result, eventTime, pollEnd time.Time, expectedPeriod, expectedReleaseDate string, logger *log.Logger) {
+	if official == nil {
+		return
+	}
+	if time.Now().After(pollEnd) {
+		return
+	}
+
+	fmt.Println()
+	fmt.Println(strings.Repeat("=", 72))
+	fmt.Println("POST-RELEASE CONFIRMATION SOURCES")
+	fmt.Println(strings.Repeat("=", 72))
+
+	ctx, cancel := context.WithDeadline(context.Background(), pollEnd)
+	defer cancel()
+
+	sources := confirmationSources()
+	outcomes := make(chan ConfirmationOutcome, len(sources))
+	var wg sync.WaitGroup
+	for _, scraper := range sources {
+		scraper := scraper
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			outcomes <- pollConfirmationSource(ctx, client, scraper, official, eventTime, expectedPeriod, expectedReleaseDate, logger)
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(outcomes)
+	}()
+
+	for outcome := range outcomes {
+		printConfirmationOutcome(outcome)
+	}
+	fmt.Println(strings.Repeat("=", 72))
+}
+
+func pollConfirmationSource(ctx context.Context, client *http.Client, scraper Scraper, official *Result, eventTime time.Time, expectedPeriod, expectedReleaseDate string, logger *log.Logger) ConfirmationOutcome {
+	ticker := time.NewTicker(confirmationCadence)
+	defer ticker.Stop()
+
+	var latest *Result
+	var lastErr error
+	for {
+		select {
+		case <-ctx.Done():
+			return confirmationNotUpdated(scraper, latest, lastErr)
+		default:
+		}
+
+		candidate, err := fetchAndParse(ctx, client, scraper, logger, false)
+		if candidate != nil && err != nil {
+			candidate.Error = err.Error()
+		}
+		if candidate != nil {
+			latest = candidate
+		}
+		if err != nil {
+			lastErr = err
+			if isTerminalConfirmationError(scraper, err) {
+				return ConfirmationOutcome{Source: scraper.Name(), Result: latest, Status: "ERROR", Message: err.Error()}
+			}
+		} else if candidate != nil {
+			if outcome, done := evaluateConfirmationCandidate(scraper, official, candidate, eventTime, expectedPeriod, expectedReleaseDate); done {
+				return outcome
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return confirmationNotUpdated(scraper, latest, lastErr)
+		case <-ticker.C:
+		}
+	}
+}
+
+func evaluateConfirmationCandidate(scraper Scraper, official, candidate *Result, eventTime time.Time, expectedPeriod, expectedReleaseDate string) (ConfirmationOutcome, bool) {
+	if err := validateResult(candidate, expectedPeriod); err != nil {
+		return ConfirmationOutcome{}, false
+	}
+	candidate.EventLatencyMs = candidate.Timestamp.Sub(eventTime).Milliseconds()
+	if len(candidate.Metrics) > 0 {
+		if err := validateMetricPayload(candidate, expectedPeriod, expectedReleaseDate); err != nil {
+			if candidate.SourceType == string(SourceInvesting) && strings.Contains(err.Error(), "INVESTING_NOT_UPDATED") {
+				return ConfirmationOutcome{}, false
+			}
+			return ConfirmationOutcome{Source: scraper.Name(), Result: candidate, Status: "MISMATCH", Message: err.Error()}, true
+		}
+		if err := compareMetricPayloads(official, candidate); err != nil {
+			return ConfirmationOutcome{Source: scraper.Name(), Result: candidate, Status: "MISMATCH", Message: err.Error()}, true
+		}
+		return ConfirmationOutcome{Source: scraper.Name(), Result: candidate, Status: "CONFIRMED", Message: "all metrics match BLS Table 1"}, true
+	}
+	if candidate.Value != official.Value {
+		return ConfirmationOutcome{Source: scraper.Name(), Result: candidate, Status: "MISMATCH", Message: fmt.Sprintf("Core CPI MoM mismatch: official=%s confirmation=%s", official.Value, candidate.Value)}, true
+	}
+	return ConfirmationOutcome{Source: scraper.Name(), Result: candidate, Status: "CONFIRMED", Message: "Core CPI MoM matches BLS Table 1"}, true
+}
+
+func confirmationNotUpdated(scraper Scraper, latest *Result, lastErr error) ConfirmationOutcome {
+	message := "not updated before confirmation window ended"
+	if latest != nil && latest.Period != "" {
+		message = fmt.Sprintf("latest period %s; expected new release", prettyPeriod(latest.Period))
+	}
+	if lastErr != nil && latest == nil {
+		message = lastErr.Error()
+		return ConfirmationOutcome{Source: scraper.Name(), Result: latest, Status: "ERROR", Message: message}
+	}
+	return ConfirmationOutcome{Source: scraper.Name(), Result: latest, Status: "NOT_UPDATED", Message: message}
+}
+
+func isTerminalConfirmationError(scraper Scraper, err error) bool {
+	if scraper.SourceType() == SourceAPI {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "request_not_processed") || strings.Contains(msg, "daily threshold") || strings.Contains(msg, "status=403") || strings.Contains(msg, "status=429")
+}
+
+func printConfirmationOutcome(outcome ConfirmationOutcome) {
+	switch outcome.Status {
+	case "CONFIRMED":
+		fmt.Printf("CONFIRMED [%s] %s\n", outcome.Source, outcome.Message)
+	case "MISMATCH":
+		if outcome.Result != nil && outcome.Result.SourceType == string(SourceInvesting) {
+			fmt.Println("INVESTING_MISMATCH")
+		}
+		fmt.Printf("MISMATCH  [%s] %s\n", outcome.Source, outcome.Message)
+	case "NOT_UPDATED":
+		if outcome.Result != nil && outcome.Result.SourceType == string(SourceInvesting) {
+			fmt.Println("INVESTING_NOT_UPDATED")
+		}
+		fmt.Printf("NOT_UPDATED [%s] %s\n", outcome.Source, outcome.Message)
+	default:
+		fmt.Printf("ERROR     [%s] %s\n", outcome.Source, outcome.Message)
+	}
+	if outcome.Result != nil {
+		fmt.Printf("    Period: %s | Value: %s | Latency: %s\n",
+			prettyPeriod(outcome.Result.Period), outcome.Result.Value, formatLatency(outcome.Result.EventLatencyMs))
+		if summary := metricConsoleSummary(outcome.Result.Metrics); summary != "" {
+			fmt.Printf("    Metrics: %s\n", summary)
+		}
+	}
+}
+
 func countdownTo(target time.Time, note string, tick time.Duration) {
 	if note != "" {
 		fmt.Printf("%s\n", note)
@@ -1251,6 +1419,14 @@ func validateResult(r *Result, expectedPeriod string) error {
 
 func isOfficialBLSURL(url string) bool {
 	return url == tableURL || url == summaryURL || url == pdfURL || url == apiURL || url == investingURL || url == scheduleURL
+}
+
+func firstHitForSource(states map[string]*SourceResult, source string) *Result {
+	state := states[source]
+	if state == nil {
+		return nil
+	}
+	return state.FirstHit
 }
 
 func mergeConfirmed(states map[string]*SourceResult, expectedPeriod, expectedReleaseDate string) (JSONResult, error) {
