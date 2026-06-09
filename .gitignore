@@ -1,0 +1,35 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Go build, test, and cache output
+*.exe
+*.exe~
+*.test
+*.out
+*.prof
+coverage.*
+.gocache/
+**/.gocache/
+.appdata/
+**/.appdata/
+
+# Temporary and editor backup files
+*.tmp
+*.bak
+*.orig
+*.swp
+*.swo
+*~
+*.go.[0-9]*
+
+# Logs and OS metadata
+*.log
+logs/
+Thumbs.db
+.DS_Store
