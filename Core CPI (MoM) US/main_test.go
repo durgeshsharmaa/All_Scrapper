@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -56,6 +57,71 @@ func TestParseTable1HTML(t *testing.T) {
 		if metric.ValueMethod != "direct_table_value" {
 			t.Fatalf("metric %s ValueMethod=%q", id, metric.ValueMethod)
 		}
+	}
+}
+
+func TestParseNumberFootnoteRejection(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantVal float64
+		wantOk  bool
+	}{
+		{"100.000", 100.0, true},
+		{"0.4%", 0.4, true},
+		{"-0.2", -0.2, true},
+		{"\u22120.3", -0.3, true},
+		{"(1)", 0.0, false},
+		{"(2)", 0.0, false},
+		{" (12) ", 0.0, false},
+		{"(p)", 0.0, false},
+		{"0.3(p)", 0.3, true},
+	}
+	for _, tc := range tests {
+		gotVal, gotOk := parseNumber(tc.input)
+		if gotOk != tc.wantOk || (gotOk && gotVal != tc.wantVal) {
+			t.Errorf("parseNumber(%q) = (%v, %v), want (%v, %v)", tc.input, gotVal, gotOk, tc.wantVal, tc.wantOk)
+		}
+	}
+}
+
+func TestExtractTable1Block(t *testing.T) {
+	htmlStr := `
+	<html>
+	<body>
+	<div class="nav-table">
+	  <table>
+	    <tr><td>All items</td><td>Some unrelated menu cell</td></tr>
+	  </table>
+	</div>
+	<div class="content">
+	  <table>
+	    <caption>Table 1. Consumer Price Index for All Urban Consumers (CPI-U): U.S. city average, April 2026 [1982-84=100]</caption>
+	    <thead>
+	      <tr><th>Expenditure category</th><th>Unadjusted 12-month percent change</th><th>Seasonally adjusted percent change</th></tr>
+	    </thead>
+	    <tbody>
+	      <tr><th>All items</th><td>100.000</td><td>320.795</td><td>330.213</td><td>333.020</td><td>3.8</td><td>0.9</td><td>0.3</td><td>0.9</td><td>0.6</td></tr>
+	      <tr><th>All items less food and energy</th><td>79.351</td><td>326.815</td><td>334.391</td><td>335.803</td><td>2.8</td><td>0.4</td><td>0.3</td><td>0.2</td><td>0.4</td></tr>
+	    </tbody>
+	  </table>
+	</div>
+	</body>
+	</html>`
+
+	got := extractTable1Block(htmlStr)
+	if !strings.Contains(got, "caption") || !strings.Contains(got, "Table 1.") {
+		t.Fatalf("expected Table 1 to be isolated, got: %s", got)
+	}
+	if strings.Contains(got, "nav-table") {
+		t.Fatalf("expected nav-table to be excluded from Table 1 block")
+	}
+
+	parsed, _, err := parseTable1HTML([]byte(htmlStr))
+	if err != nil {
+		t.Fatalf("parseTable1HTML failed on multi-table HTML: %v", err)
+	}
+	if parsed.Period != "2026-04" || parsed.ValueString != "0.4" {
+		t.Fatalf("incorrect parsed values: Period=%s, Value=%s", parsed.Period, parsed.ValueString)
 	}
 }
 

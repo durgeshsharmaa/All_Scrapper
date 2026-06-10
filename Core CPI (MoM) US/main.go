@@ -69,7 +69,7 @@ const (
 	testLead            = 1 * time.Minute
 	sniperLead          = 2 * time.Second
 	pollWindow          = 3 * time.Minute
-	userAgent           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 US-CPI-Table1-Sniper/1.0"
+	userAgent           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
 type SourceType string
@@ -530,7 +530,7 @@ func parsedValueToResult(scraper Scraper, parsed ParsedValue, warnings []string)
 
 func newHTTPClient() *http.Client {
 	dialer := &net.Dialer{
-		Timeout:   1200 * time.Millisecond,
+		Timeout:   2000 * time.Millisecond,
 		KeepAlive: 30 * time.Second,
 	}
 	return &http.Client{
@@ -542,7 +542,7 @@ func newHTTPClient() *http.Client {
 			MaxIdleConns:          64,
 			MaxIdleConnsPerHost:   12,
 			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   1200 * time.Millisecond,
+			TLSHandshakeTimeout:   2000 * time.Millisecond,
 			ResponseHeaderTimeout: 2500 * time.Millisecond,
 			ExpectContinueTimeout: 250 * time.Millisecond,
 		},
@@ -1072,6 +1072,12 @@ func runFastPrimarySniperMode(client *http.Client, baselines map[string]*SourceR
 			}
 		}
 
+		// Drain any queued ticks to avoid immediate back-to-back polling if request was slow
+		select {
+		case <-ticker.C:
+		default:
+		}
+
 		select {
 		case <-ctx.Done():
 			return results
@@ -1247,123 +1253,7 @@ func countdownTo(target time.Time, note string, tick time.Duration) {
 	}
 }
 
-func runSniperMode(client *http.Client, sources []Scraper, baselines map[string]*SourceResult, eventTime, pollEnd time.Time, expectedPeriod string, logger *log.Logger) map[string]*SourceResult {
-	ctx, cancel := context.WithDeadline(context.Background(), pollEnd)
-	defer cancel()
 
-	results := make(map[string]*SourceResult, len(sources))
-	for _, scraper := range sources {
-		if existing := baselines[scraper.Name()]; existing != nil {
-			results[scraper.Name()] = existing
-		} else {
-			results[scraper.Name()] = &SourceResult{Name: scraper.Name()}
-		}
-	}
-
-	hits := make(chan *Result, len(sources)*4)
-	var wg sync.WaitGroup
-	for _, scraper := range sources {
-		scraper := scraper
-		state := results[scraper.Name()]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			pollSource(ctx, client, scraper, state, eventTime, expectedPeriod, hits, logger)
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(hits)
-	}()
-
-	for hit := range hits {
-		fmt.Printf("[%s] UPDATED! [%s] Period: %s | Value: %s | Detected by: %s\n",
-			hit.Timestamp.UTC().Format("15:04:05.000"), hit.Source, prettyPeriod(hit.Period), hit.Value, hit.DetectionMethod)
-		if summary := metricConsoleSummary(hit.Metrics); summary != "" {
-			fmt.Printf("    Metrics: %s\n", summary)
-		}
-	}
-
-	return results
-}
-
-func pollSource(ctx context.Context, client *http.Client, scraper Scraper, state *SourceResult, eventTime time.Time, expectedPeriod string, hits chan<- *Result, logger *log.Logger) {
-	ticker := time.NewTicker(pollCadence)
-	defer ticker.Stop()
-
-	pollNo := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		pollNo++
-		checkContent := pollNo%contentEveryPolls == 0 || state.Baseline == nil
-		var candidate *Result
-		var err error
-		headersChanged := false
-		contentChecked := false
-
-		if checkContent {
-			contentChecked = true
-			candidate, err = fetchAndParse(ctx, client, scraper, logger, false)
-		} else {
-			headerResult, headerErr := scraper.FetchWithHeaders(ctx, client)
-			if headerErr != nil {
-				err = headerErr
-				candidate = headerResult
-			} else {
-				headersChanged = hasHeaderChange(state.Baseline, headerResult)
-				if headersChanged {
-					contentChecked = true
-					candidate, err = fetchAndParse(ctx, client, scraper, logger, false)
-				} else {
-					state.Latest = headerResult
-				}
-			}
-		}
-
-		if candidate != nil && err != nil {
-			candidate.Error = err.Error()
-			state.Latest = candidate
-		}
-
-		if candidate != nil && candidate.Error == "" && contentChecked {
-			contentChanged := hasContentChange(state.Baseline, candidate)
-			if headersChanged || contentChanged {
-				method := detectionMethod(headersChanged, contentChanged)
-				if err := validateResult(candidate, expectedPeriod); err == nil {
-					candidate.DetectionMethod = method
-					candidate.EventLatencyMs = candidate.Timestamp.Sub(eventTime).Milliseconds()
-					state.Latest = candidate
-					if state.FirstHit == nil {
-						state.FirstHit = cloneResult(candidate)
-						state.Detected = true
-						hits <- cloneResult(candidate)
-					}
-				} else {
-					state.Latest = candidate
-				}
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func hasHeaderChange(b *Baseline, r *Result) bool {
-	if b == nil || r == nil {
-		return false
-	}
-	return changedHeader(b.ETag, r.ETag) || changedHeader(b.LastModified, r.LastModified)
-}
 
 func changedHeader(base, current string) bool {
 	base = strings.TrimSpace(base)
@@ -1381,16 +1271,7 @@ func hasContentChange(b *Baseline, r *Result) bool {
 	return b.Period != r.Period || b.Value != r.Value || changedHeader(b.ContentHash, r.ContentHash)
 }
 
-func detectionMethod(headersChanged, contentChanged bool) string {
-	switch {
-	case headersChanged && contentChanged:
-		return "headers+content"
-	case headersChanged:
-		return "headers"
-	default:
-		return "content"
-	}
-}
+
 
 func validateResult(r *Result, expectedPeriod string) error {
 	if r == nil {
@@ -1645,39 +1526,7 @@ func printPerformanceTable(states map[string]*SourceResult, eventTime time.Time)
 	fmt.Println(strings.Repeat("=", 72))
 }
 
-func printInvestingConfirmationStatus(states map[string]*SourceResult, expectedPeriod, expectedReleaseDate string) {
-	state := states[(investingScraper{}).Name()]
-	if state == nil {
-		return
-	}
-	if state.FirstHit == nil {
-		if investingNotUpdated(state.Latest, expectedPeriod, expectedReleaseDate) {
-			fmt.Println("INVESTING_NOT_UPDATED")
-		}
-		return
-	}
-	if investingNotUpdated(state.FirstHit, expectedPeriod, expectedReleaseDate) {
-		fmt.Println("INVESTING_NOT_UPDATED")
-	}
-}
 
-func investingNotUpdated(result *Result, expectedPeriod, expectedReleaseDate string) bool {
-	if result == nil || result.SourceType != string(SourceInvesting) {
-		return false
-	}
-	if expectedPeriod != "" && result.Period != "" && result.Period != expectedPeriod {
-		return true
-	}
-	for _, metric := range result.Metrics {
-		if expectedPeriod != "" && metric.Period != "" && metric.Period != expectedPeriod {
-			return true
-		}
-		if expectedReleaseDate != "" && metric.LatestReleaseDate != "" && metric.LatestReleaseDate != expectedReleaseDate {
-			return true
-		}
-	}
-	return false
-}
 
 func metricConsoleSummary(metrics map[string]MetricValue) string {
 	ordered := orderedMetrics(metrics)
@@ -1776,9 +1625,24 @@ func parseReleaseSchedule(text string) (time.Time, error) {
 	return time.Date(releaseYear, time.Month(releaseMonth), releaseDay, releaseHour, releaseMinute, 0, 0, loc).UTC(), nil
 }
 
+func extractTable1Block(htmlDoc string) string {
+	tableRe := regexp.MustCompile(`(?is)<table\b[^>]*>(.*?)</table>`)
+	matches := tableRe.FindAllString(htmlDoc, -1)
+	for _, table := range matches {
+		tableLower := strings.ToLower(table)
+		if strings.Contains(tableLower, "table 1") &&
+			strings.Contains(tableLower, strings.ToLower(allItemsField)) &&
+			strings.Contains(tableLower, strings.ToLower(targetField)) {
+			return table
+		}
+	}
+	return htmlDoc
+}
+
 func parseTable1HTML(body []byte) (ParsedValue, []string, error) {
 	doc := string(body)
-	plain := normalizeSpace(stripHTML(doc))
+	tableBlock := extractTable1Block(doc)
+	plain := normalizeSpace(stripHTML(tableBlock))
 	lower := strings.ToLower(plain)
 	if !strings.Contains(lower, "table 1") || !strings.Contains(lower, strings.ToLower(allItemsField)) || !strings.Contains(lower, strings.ToLower(targetField)) {
 		return ParsedValue{}, nil, errors.New("table 1 or required CPI rows not found")
@@ -1790,8 +1654,8 @@ func parseTable1HTML(body []byte) (ParsedValue, []string, error) {
 		return ParsedValue{}, nil, errors.New("seasonally adjusted percent change header not found")
 	}
 
-	rows := htmlRows(doc)
-	period := parseLatestPeriod(doc)
+	rows := htmlRows(tableBlock)
+	period := parseLatestPeriod(tableBlock)
 	if period == "" {
 		return ParsedValue{}, nil, errors.New("latest release month not found in table")
 	}
@@ -2552,6 +2416,14 @@ func numbersFromText(s string) []float64 {
 func parseNumber(s string) (float64, bool) {
 	clean := strings.ReplaceAll(s, "\u2212", "-")
 	clean = strings.ReplaceAll(clean, "%", "")
+	// Skip cells containing only a footnote number in parentheses like "(1)"
+	trimmed := strings.TrimSpace(clean)
+	if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.Trim(trimmed, "()")
+		if _, err := strconv.Atoi(inner); err == nil {
+			return 0, false
+		}
+	}
 	re := regexp.MustCompile(`[-+]?\d[\d,]*(?:\.\d+)?`)
 	match := re.FindString(clean)
 	if match == "" {
