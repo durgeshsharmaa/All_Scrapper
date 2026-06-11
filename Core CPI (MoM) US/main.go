@@ -35,7 +35,7 @@ import (
 // IST = UTC + 5:30
 //
 // Format: "YYYY-MM-DD HH:MM:SS" in UTC.
-var eventTimeUTC = "2026-06-10 12:30:00"
+var eventTimeUTC = "2026-07-15 12:30:00"
 
 // ============================================================================
 
@@ -1029,60 +1029,106 @@ func runFastPrimarySniperMode(client *http.Client, baselines map[string]*SourceR
 	ctx, cancel := context.WithDeadline(context.Background(), pollEnd)
 	defer cancel()
 
-	scraper := tableScraper{}
-	state := baselines[scraper.Name()]
-	if state == nil {
-		state = &SourceResult{Name: scraper.Name()}
+	// --- Fast Path scrapers: HTML (primary) + PDF + API (fallbacks if HTML is blocked) ---
+	htmlScraper := tableScraper{}
+	pdfFast := pdfScraper{}
+	apiFast := apiScraper{}
+
+	htmlState := baselines[htmlScraper.Name()]
+	if htmlState == nil {
+		htmlState = &SourceResult{Name: htmlScraper.Name()}
 	}
-	results := map[string]*SourceResult{scraper.Name(): state}
-	ticker := time.NewTicker(fastPollCadence)
-	defer ticker.Stop()
+	pdfState := baselines[pdfFast.Name()]
+	if pdfState == nil {
+		pdfState = &SourceResult{Name: pdfFast.Name()}
+	}
+	apiState := baselines[apiFast.Name()]
+	if apiState == nil {
+		apiState = &SourceResult{Name: apiFast.Name()}
+	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return results
-		default:
-		}
+	results := map[string]*SourceResult{
+		htmlScraper.Name(): htmlState,
+		pdfFast.Name():     pdfState,
+		apiFast.Name():     apiState,
+	}
 
-		candidate, err := fetchAndParseWithTimeout(ctx, client, scraper, logger, false, fastRequestTimeout)
-		if candidate != nil && err != nil {
-			candidate.Error = err.Error()
-			state.Latest = candidate
-		}
-		if candidate != nil && candidate.Error == "" {
-			state.Latest = candidate
-			contentChanged := hasContentChange(state.Baseline, candidate)
-			if err := validateResult(candidate, expectedPeriod); err == nil {
-				if err := validateMetricPayload(candidate, expectedPeriod, ""); err == nil {
-					candidate.DetectionMethod = "fast_table_content"
-					if contentChanged {
-						candidate.DetectionMethod = "fast_table_content_changed"
+	type hit struct {
+		state     *SourceResult
+		candidate *Result
+		method    string
+	}
+	triggerCh := make(chan hit, 1)
+
+	runPath := func(scraper Scraper, state *SourceResult, method string, cadence time.Duration) {
+		ticker := time.NewTicker(cadence)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			candidate, err := fetchAndParseWithTimeout(ctx, client, scraper, logger, false, fastRequestTimeout)
+			if candidate != nil && err != nil {
+				candidate.Error = err.Error()
+				state.Latest = candidate
+			}
+			if candidate != nil && candidate.Error == "" {
+				state.Latest = candidate
+				contentChanged := hasContentChange(state.Baseline, candidate)
+				_ = contentChanged
+				if err := validateResult(candidate, expectedPeriod); err == nil {
+					if err := validateMetricPayload(candidate, expectedPeriod, ""); err == nil {
+						candidate.DetectionMethod = method
+						candidate.EventLatencyMs = candidate.Timestamp.Sub(eventTime).Milliseconds()
+						select {
+						case triggerCh <- hit{state: state, candidate: candidate, method: method}:
+						default:
+						}
+						return
 					}
-					candidate.EventLatencyMs = candidate.Timestamp.Sub(eventTime).Milliseconds()
-					state.FirstHit = cloneResult(candidate)
-					state.Detected = true
-					fmt.Printf("[%s] UPDATED! [%s] Period: %s | Value: %s | Detected by: %s\n",
-						candidate.Timestamp.UTC().Format("15:04:05.000"), candidate.Source, prettyPeriod(candidate.Period), candidate.Value, candidate.DetectionMethod)
-					if summary := metricConsoleSummary(candidate.Metrics); summary != "" {
-						fmt.Printf("    Metrics: %s\n", summary)
-					}
-					return results
 				}
 			}
-		}
 
-		// Drain any queued ticks to avoid immediate back-to-back polling if request was slow
-		select {
-		case <-ticker.C:
-		default:
+			// Drain queued ticks
+			select {
+			case <-ticker.C:
+			default:
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
+	}
 
-		select {
-		case <-ctx.Done():
-			return results
-		case <-ticker.C:
+	// BLS HTML: 100ms (primary fastest)
+	go runPath(htmlScraper, htmlState, "fast_table_html", fastPollCadence)
+	// BLS PDF: 500ms (fallback — slower but BLS rarely blocks PDF)
+	go runPath(pdfFast, pdfState, "fast_pdf_fallback", 500*time.Millisecond)
+	// BLS API: 1s (last resort — API update may lag by a few seconds)
+	go runPath(apiFast, apiState, "fast_api_fallback", 1*time.Second)
+
+	select {
+	case <-ctx.Done():
+		return results
+	case h := <-triggerCh:
+		cancel() // stop all other goroutines
+		h.state.FirstHit = cloneResult(h.candidate)
+		h.state.Detected = true
+		fmt.Printf("[%s] UPDATED! [%s] Period: %s | Value: %s | Detected by: %s\n",
+			h.candidate.Timestamp.UTC().Format("15:04:05.000"),
+			h.candidate.Source,
+			prettyPeriod(h.candidate.Period),
+			h.candidate.Value,
+			h.method)
+		if summary := metricConsoleSummary(h.candidate.Metrics); summary != "" {
+			fmt.Printf("    Metrics: %s\n", summary)
 		}
+		return results
 	}
 }
 
