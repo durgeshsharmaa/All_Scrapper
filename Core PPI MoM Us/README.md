@@ -59,7 +59,7 @@ Core PPI (YoY): 5.2%
 
 ## Update For Next Event
 
-Edit `eventTimeUTC` in `main.go`.
+Do not edit source code for the release time. Pass it at runtime with `-event-time-utc` or set `PPI_EVENT_TIME_UTC`.
 
 Use UTC format:
 
@@ -67,7 +67,11 @@ Use UTC format:
 YYYY-MM-DD HH:MM:SS
 ```
 
-The configured event is the May 2026 PPI release on June 11, 2026 at 08:30 Eastern, which is `2026-06-11 12:30:00` UTC.
+Example for the May 2026 PPI release on June 11, 2026 at 08:30 Eastern:
+
+```powershell
+go run . -event-time-utc "2026-06-11 12:30:00"
+```
 
 ## Production Pipeline
 
@@ -81,11 +85,12 @@ The production scraper:
 
 - fetches all sources concurrently at startup
 - captures baseline headers, content hashes, period, and value signatures
-- polls every 500 ms per source
-- checks headers every poll and content every fifth poll
-- fetches content immediately when `ETag` or `Last-Modified` changes
-- selects Source 1 as the primary low-latency value source
-- rejects same-period official value disagreement between Source 1 and Source 2
+- uses Source 1 as the low-latency primary value source
+- polls Source 1 content every 100 ms during the release window
+- races Source 2 PDF as an official value backup on a slower cadence
+- validates the new expected period, exact rows, columns, units, source identity, and value bounds before printing JSON
+- polls remaining official sources after the first valid value hit for confirmation
+- reports Source 2 disagreement as `MISMATCH`
 - never uses Source 3 summary values for the grouped extraction
 
 ## Run
@@ -93,11 +98,24 @@ The production scraper:
 Run sniper mode:
 
 ```powershell
-go run main.go
+go run . -event-time-utc "2026-06-11 12:30:00"
 ```
 
-At startup the scraper fetches the current BLS Table 1 values, displays UTC and IST event times, validates the configured date against the BLS PPI release schedule, captures baseline headers/content one minute before release, activates sniper mode two seconds before release, polls for three minutes, and prints `NOT_CONFIRMED` if validation fails or the expected release period is not detected.
+Or:
 
-The scraper has no required command-line arguments. Edit `eventTimeUTC` in `main.go` for the next release.
+```powershell
+$env:PPI_EVENT_TIME_UTC = "2026-06-11 12:30:00"
+go run .
+```
+
+At startup the scraper fetches the current BLS sources, displays UTC and IST event times, validates the configured date against the BLS PPI release schedule, captures baseline headers/content one minute before release, activates sniper mode two seconds before release, polls for three minutes, and prints `NOT_CONFIRMED` if validation fails or the expected release period is not detected.
 
 Source 2 PDF parsing and Source 3 release-summary confirmation are implemented inside `main.go`. Source 3 checks release availability, release month/date, and narrative signals, but it does not supply grouped values. This avoids substituting the summary measure `Final demand less foods, energy, and trade services` for the target Core PPI row `FD 49104`.
+
+## Build And Test
+
+```powershell
+go test ./...
+go vet ./...
+go build -o ppi_sniper.exe .
+```

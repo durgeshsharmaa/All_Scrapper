@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"html"
 	"io"
@@ -25,18 +26,16 @@ import (
 	_ "time/tzdata"
 )
 
-// ============================================================================
-// EVENT CONFIGURATION - CHANGE THIS FOR NEXT PPI RELEASE
-// ============================================================================
-//
-// Event group: U.S. PPI / Core PPI MoM and YoY
-// Release Time: 08:30 Eastern Time
-// IST = UTC + 5:30
-//
-// Format: "YYYY-MM-DD HH:MM:SS" in UTC.
-var eventTimeUTC = "2026-06-11 12:30:00"
+// Event group: U.S. PPI / Core PPI MoM and YoY.
+// Release time is 08:30 Eastern. Configure the exact UTC timestamp per run.
+const (
+	eventTimeLayout          = "2006-01-02 15:04:05"
+	eventTimeEnv             = "PPI_EVENT_TIME_UTC"
+	defaultEventTimeUTC      = "2026-06-11 12:30:00" // 2026-06-11 18:00:00 IST
+	headerFallbackDrainLimit = 512 * 1024
+)
 
-// ============================================================================
+var eventTimeUTCFlag = flag.String("event-time-utc", defaultEventTimeUTC, `release time in UTC, format "YYYY-MM-DD HH:MM:SS"`)
 
 const (
 	country         = "US"
@@ -53,16 +52,22 @@ const (
 	summaryURL  = "https://www.bls.gov/news.release/ppi.nr0.htm"
 	scheduleURL = "https://www.bls.gov/schedule/news_release/ppi.htm"
 
-	httpTimeout          = 12 * time.Second
-	requestTimeout       = 10 * time.Second
-	headerRequestTimeout = 2 * time.Second
-	pollCadence          = 500 * time.Millisecond
-	contentEveryPolls    = 5
-	testLead             = 1 * time.Minute
-	sniperLead           = 2 * time.Second
-	pollWindow           = 3 * time.Minute
-	confirmationGrace    = 1500 * time.Millisecond
-	userAgent            = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 PPI-Group-Sniper/1.0"
+	// Tuned for EC2 us-east-1 against BLS Washington/DC-area infrastructure.
+	httpTimeout             = 8 * time.Second
+	requestTimeout          = 7 * time.Second
+	primaryRequestTimeout   = 4500 * time.Millisecond
+	pdfBackupRequestTimeout = 6500 * time.Millisecond
+	headerRequestTimeout    = 900 * time.Millisecond
+	pollCadence             = 250 * time.Millisecond
+	primaryPollCadence      = 100 * time.Millisecond
+	pdfBackupPollCadence    = 750 * time.Millisecond
+	confirmationCadence     = 750 * time.Millisecond
+	confirmationTimeout     = 2 * time.Minute
+	contentEveryPolls       = 4
+	testLead                = 1 * time.Minute
+	sniperLead              = 2 * time.Second
+	pollWindow              = 3 * time.Minute
+	userAgent               = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 PPI-Group-Sniper/2.0"
 )
 
 type ValueKind string
@@ -157,6 +162,26 @@ var summarySource = Source{
 	ValueMethod: summaryMethod,
 	Confidence:  "CONFIRMATION",
 }
+
+var (
+	releasePeriodRe         = regexp.MustCompile(`(?i)\bPRODUCER PRICE INDEXES\s*[-\x{2013}]\s*([A-Za-z]+)\s+(20\d{2})\b`)
+	pdfStreamRe             = regexp.MustCompile(`(?s)<<(.*?)>>\s*stream\r?\n(.*?)\r?\nendstream`)
+	pdfLiteralRe            = regexp.MustCompile(`\((?:\\.|[^\\()])*\)`)
+	pdfHexRe                = regexp.MustCompile(`<([0-9A-Fa-f\s]+)>`)
+	numberRe                = regexp.MustCompile(`[-+]?\d[\d,]*(?:\.\d+)?`)
+	htmlRowRe               = regexp.MustCompile(`(?is)<tr\b[^>]*>(.*?)</tr>`)
+	htmlCellRe              = regexp.MustCompile(`(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>`)
+	htmlScriptRe            = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`)
+	htmlStyleRe             = regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`)
+	htmlBreakRe             = regexp.MustCompile(`(?i)<\s*(br|/p|/tr|/th|/td|/li|/div)\b[^>]*>`)
+	htmlTagRe               = regexp.MustCompile(`(?s)<[^>]+>`)
+	trailingFootnoteRe      = regexp.MustCompile(`\s*\(\s*\d+\s*\)\s*$`)
+	mResultsPeriodRe        = regexp.MustCompile(`(?i)\b(20\d{2})\s+M(0[1-9]|1[0-2])\s+Results\b`)
+	tableCaptionPeriodRe    = regexp.MustCompile(`(?i)\[\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\s*\]`)
+	latestMonthYearPeriodRe = regexp.MustCompile(`(?i)\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b`)
+)
+
+var pdfTargetRowRegexes = buildPDFTargetRowRegexes()
 
 type Latency struct {
 	Total    int64 `json:"total"`
@@ -278,20 +303,26 @@ type JSONSnapshot struct {
 }
 
 func main() {
+	flag.Parse()
+
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
-	eventTime, err := parseConfiguredEventTime()
+	eventTime, eventTimeSource, err := parseConfiguredEventTime()
 	if err != nil {
 		fmt.Println("NOT_CONFIRMED")
-		logger.Printf("invalid eventTimeUTC: %v", err)
+		logger.Printf("invalid event time configuration: %v", err)
 		os.Exit(1)
 	}
 
 	client := newHTTPClient()
 	sources := productionSources()
 	expectedPeriod := expectedReleasePeriod(eventTime)
-	printBanner(eventTime)
+	printBanner(eventTime, eventTimeSource)
 
-	if warning := validateConfiguredSchedule(client, eventTime, logger); warning != "" {
+	if warning, err := validateConfiguredSchedule(client, eventTime, logger); err != nil {
+		fmt.Println("NOT_CONFIRMED")
+		logger.Printf("BLS PPI schedule validation failed: %v", err)
+		return
+	} else if warning != "" {
 		fmt.Printf("WARNING: %s\n", warning)
 	}
 
@@ -327,30 +358,36 @@ func main() {
 
 	fmt.Println("SNIPER MODE ACTIVATED!")
 	fmt.Println(strings.Repeat("=", 72))
-	fmt.Println("Using HYBRID detection: Headers every 500ms + Content every 5th poll")
+	fmt.Println("Using OFFICIAL FAST PATH: BLS HTML every 100ms with PDF value backup")
+	fmt.Println("Remaining official sources confirm after first valid JSON output")
 	fmt.Println(strings.Repeat("=", 72))
 
-	states = runSniperMode(client, sources, states, eventTime, pollEnd, expectedPeriod, logger)
+	primaryHit, err := runOfficialValueFastPath(client, states, eventTime, pollEnd, expectedPeriod, logger)
+	if err != nil {
+		fmt.Println()
+		fmt.Println(strings.Repeat("=", 72))
+		fmt.Println("Polling window complete")
+		fmt.Println(strings.Repeat("=", 72))
+		fmt.Println("NOT_CONFIRMED")
+		logger.Printf("primary fast path failed: %v", err)
+		return
+	}
+
+	printJSON(toJSON(primaryHit, []string{primaryHit.Source}))
+
+	states = runPostReleaseConfirmations(client, states, primaryHit, expectedPeriod, logger)
 	fmt.Println()
 	fmt.Println(strings.Repeat("=", 72))
-	fmt.Println("Polling window complete")
+	fmt.Println("Post-release confirmation complete")
 	fmt.Println(strings.Repeat("=", 72))
 	fmt.Println()
 
 	printPerformanceTable(states, eventTime)
-	finalResults := firstHits(states)
-	confirmed, matched, err := mergeConfirmed(finalResults, expectedPeriod)
-	if err != nil {
-		fmt.Println("NOT_CONFIRMED")
-		logger.Printf("final values failed confirmation: %v", err)
-		return
-	}
-	printJSON(toJSON(confirmed, matched))
 }
 
 func newHTTPClient() *http.Client {
 	dialer := &net.Dialer{
-		Timeout:   800 * time.Millisecond,
+		Timeout:   300 * time.Millisecond,
 		KeepAlive: 30 * time.Second,
 	}
 	return &http.Client{
@@ -363,9 +400,9 @@ func newHTTPClient() *http.Client {
 			MaxIdleConnsPerHost:   24,
 			MaxConnsPerHost:       24,
 			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   1500 * time.Millisecond,
-			ResponseHeaderTimeout: 4 * time.Second,
-			ExpectContinueTimeout: 250 * time.Millisecond,
+			TLSHandshakeTimeout:   700 * time.Millisecond,
+			ResponseHeaderTimeout: 1500 * time.Millisecond,
+			ExpectContinueTimeout: 100 * time.Millisecond,
 		},
 	}
 }
@@ -465,12 +502,14 @@ func fetchHeadersViaGET(parent context.Context, client *http.Client, source Sour
 		return nil, err
 	}
 	setHeaders(req)
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Range", "bytes=0-0")
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body, headerFallbackDrainLimit)
 
 	result := resultFromHeaders(source, resp.Header, resp.StatusCode, Latency{
 		Total: time.Since(start).Milliseconds(),
@@ -482,8 +521,23 @@ func fetchHeadersViaGET(parent context.Context, client *http.Client, source Sour
 	return result, nil
 }
 
+func drainAndClose(body io.ReadCloser, maxBytes int64) {
+	if body == nil {
+		return
+	}
+	defer body.Close()
+	if maxBytes <= 0 {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxBytes))
+}
+
 func fetchAndParse(parent context.Context, client *http.Client, source Source, logger *log.Logger, logDetail bool) (*SnapshotResult, error) {
-	ctx, cancel := context.WithTimeout(parent, requestTimeout)
+	return fetchAndParseWithTimeout(parent, client, source, requestTimeout, logger, logDetail)
+}
+
+func fetchAndParseWithTimeout(parent context.Context, client *http.Client, source Source, timeout time.Duration, logger *log.Logger, logDetail bool) (*SnapshotResult, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	start := time.Now()
@@ -622,16 +676,30 @@ func resultFromHeaders(source Source, headers http.Header, statusCode int, laten
 func setHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Pragma", "no-cache")
 }
 
-func parseConfiguredEventTime() (time.Time, error) {
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", eventTimeUTC, time.UTC)
-	if err != nil {
-		return time.Time{}, err
+func parseConfiguredEventTime() (time.Time, string, error) {
+	raw := strings.TrimSpace(*eventTimeUTCFlag)
+	source := "-event-time-utc"
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv(eventTimeEnv))
+		source = eventTimeEnv
 	}
-	return t.UTC(), nil
+	if raw == "" {
+		return time.Time{}, "", fmt.Errorf("missing release time: pass -event-time-utc or set %s using UTC format %q", eventTimeEnv, eventTimeLayout)
+	}
+
+	t, err := time.ParseInLocation(eventTimeLayout, raw, time.UTC)
+	if err != nil {
+		if rfc3339Time, rfc3339Err := time.Parse(time.RFC3339, raw); rfc3339Err == nil {
+			return rfc3339Time.UTC(), source, nil
+		}
+		return time.Time{}, source, fmt.Errorf("parse %s=%q as UTC %q: %w", source, raw, eventTimeLayout, err)
+	}
+	return t.UTC(), source, nil
 }
 
 func expectedReleasePeriod(eventTime time.Time) string {
@@ -648,13 +716,14 @@ func expectedReleasePeriod(eventTime time.Time) string {
 	return fmt.Sprintf("%04d-%02d", year, month)
 }
 
-func printBanner(eventTime time.Time) {
+func printBanner(eventTime time.Time, eventTimeSource string) {
 	ist := time.FixedZone("IST", 5*3600+30*60)
 	fmt.Println(strings.Repeat("=", 72))
 	fmt.Println("US PPI Group Scraper - SNIPER MODE")
 	fmt.Println(strings.Repeat("=", 72))
 	fmt.Printf("Publisher: %s\n", publisher)
 	fmt.Printf("Primary Source: %s\n", tableURL)
+	fmt.Printf("Event Time Source: %s\n", eventTimeSource)
 	fmt.Println("Targets:")
 	for _, target := range measureTargets {
 		fmt.Printf("  %s | Row: %s | Code: %s %s | Kind: %s\n",
@@ -756,114 +825,428 @@ func printBaselines(states map[string]*SourceResult) {
 	fmt.Println(strings.Repeat("-", 176))
 }
 
-func runSniperMode(client *http.Client, sources []Source, states map[string]*SourceResult, eventTime, pollEnd time.Time, expectedPeriod string, logger *log.Logger) map[string]*SourceResult {
-	stopCh := make(chan struct{})
-	var stopOnce sync.Once
+type ConfirmationOutcome struct {
+	Source string
+	Status string
+	Period string
+	Values string
+	Detail string
+	Result *SnapshotResult
+}
+
+type valuePollConfig struct {
+	Source  Source
+	Cadence time.Duration
+	Timeout time.Duration
+	Method  string
+}
+
+func runOfficialValueFastPath(client *http.Client, states map[string]*SourceResult, eventTime, pollEnd time.Time, expectedPeriod string, logger *log.Logger) (*SnapshotResult, error) {
+	configs := []valuePollConfig{
+		{Source: primarySource, Cadence: primaryPollCadence, Timeout: primaryRequestTimeout, Method: "primary-content"},
+		{Source: pdfSource, Cadence: pdfBackupPollCadence, Timeout: pdfBackupRequestTimeout, Method: "pdf-backup-content"},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hits := make(chan *SnapshotResult, len(configs))
+	errs := make(chan error, len(configs))
 	var wg sync.WaitGroup
 
-	for _, source := range sources {
-		source := source
-		state := states[source.Name]
-		if state == nil {
-			state = &SourceResult{Name: source.Name, Source: source}
-			states[source.Name] = state
-		}
+	for _, config := range configs {
+		config := config
+		state := ensureSourceState(states, config.Source)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			pollSource(client, source, state, eventTime, pollEnd, expectedPeriod, stopCh, &stopOnce, logger)
+			if err := pollValueSourceFastPath(ctx, client, config, state, eventTime, pollEnd, expectedPeriod, hits, logger); err != nil {
+				errs <- err
+			}
 		}()
 	}
 
-	wg.Wait()
-	return states
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case hit := <-hits:
+		cancel()
+		<-done
+		return hit, nil
+	case <-done:
+		close(errs)
+		var details []string
+		for err := range errs {
+			if err != nil {
+				details = append(details, err.Error())
+			}
+		}
+		if len(details) == 0 {
+			return nil, fmt.Errorf("no official value source produced a valid %s result before poll window ended", expectedPeriod)
+		}
+		return nil, fmt.Errorf("no official value source produced a valid %s result before poll window ended: %s", expectedPeriod, strings.Join(details, "; "))
+	}
 }
 
-func pollSource(client *http.Client, source Source, state *SourceResult, eventTime, pollEnd time.Time, expectedPeriod string, stopCh chan struct{}, stopOnce *sync.Once, logger *log.Logger) {
-	pollCount := 0
+func pollValueSourceFastPath(ctx context.Context, client *http.Client, config valuePollConfig, state *SourceResult, eventTime, pollEnd time.Time, expectedPeriod string, hits chan<- *SnapshotResult, logger *log.Logger) error {
+	var lastErr error
+	polls := 0
+
 	for time.Now().UTC().Before(pollEnd) {
 		select {
-		case <-stopCh:
-			return
+		case <-ctx.Done():
+			return nil
 		default:
 		}
 
-		pollCount++
-		checkContent := pollCount%contentEveryPolls == 0
-		headerResult, err := fetchHeadersOnly(context.Background(), client, source)
+		pollStart := time.Now()
+		polls++
+
+		result, err := fetchAndParseWithTimeout(ctx, client, config.Source, config.Timeout, logger, false)
 		if err != nil {
-			logger.Printf("%s header poll failed: %v", source.Name, err)
-			sleepOrStop(stopCh, pollCadence)
+			lastErr = err
+			if result != nil {
+				state.Mu.Lock()
+				state.Latest = result
+				state.Mu.Unlock()
+			}
+			logger.Printf("%s value poll failed: %v", config.Source.Name, err)
+			if !sleepAfterPollOrDone(ctx, pollStart, config.Cadence) {
+				return nil
+			}
 			continue
 		}
 
 		state.Mu.Lock()
 		baseline := state.Baseline
+		state.Latest = result
 		state.Mu.Unlock()
 
-		headersChanged := false
-		if baseline != nil {
-			if headerResult.ETag != "" && headerResult.ETag != baseline.ETag {
-				headersChanged = true
+		if !primaryContentChanged(result, baseline) {
+			if !sleepAfterPollOrDone(ctx, pollStart, config.Cadence) {
+				return nil
 			}
-			if headerResult.LastModified != "" && headerResult.LastModified != baseline.LastModified {
-				headersChanged = true
+			continue
+		}
+		if err := validateOfficialValueFastPathResult(config.Source, result, expectedPeriod); err != nil {
+			lastErr = err
+			logger.Printf("%s value candidate rejected: %v", config.Source.Name, err)
+			if !sleepAfterPollOrDone(ctx, pollStart, config.Cadence) {
+				return nil
 			}
+			continue
 		}
 
-		if headersChanged || checkContent {
-			result, err := fetchAndParse(context.Background(), client, source, logger, false)
-			if err != nil {
-				logger.Printf("%s content poll failed: %v", source.Name, err)
-				sleepOrStop(stopCh, pollCadence)
-				continue
-			}
-
-			state.Mu.Lock()
-			state.Latest = result
-			state.Mu.Unlock()
-
-			contentChanged := baseline == nil ||
-				result.ContentHash != baseline.ContentHash ||
-				result.Period != baseline.Period ||
-				measureSignature(result.Measures) != baseline.Signature
-
-			if contentChanged && result.Period == expectedPeriod {
-				method := "content"
-				if headersChanged {
-					method = "headers+content"
-				}
-				result.DetectionMethod = method
-				result.Timestamp = time.Now().UTC()
-				result.EventLatencyMs = result.Timestamp.Sub(eventTime).Milliseconds()
-
-				state.Mu.Lock()
-				if !state.Detected {
-					state.FirstHit = result
-					state.Detected = true
-					printUpdate(result, source)
-					if source.Primary {
-						go func() {
-							time.Sleep(confirmationGrace)
-							stopOnce.Do(func() { close(stopCh) })
-						}()
-					}
-				}
-				state.Mu.Unlock()
-			}
+		result.DetectionMethod = config.Method
+		result.Timestamp = time.Now().UTC()
+		result.EventLatencyMs = result.Timestamp.Sub(eventTime).Milliseconds()
+		for i := range result.Measures {
+			result.Measures[i].Timestamp = result.Timestamp
 		}
 
-		sleepOrStop(stopCh, pollCadence)
+		state.Mu.Lock()
+		if state.FirstHit == nil {
+			state.FirstHit = result
+			state.Detected = true
+		}
+		state.Mu.Unlock()
+
+		printUpdate(result, config.Source)
+		logger.Printf("%s fast path confirmed after %d polls latency_ms=%d", config.Source.Name, polls, result.EventLatencyMs)
+		select {
+		case hits <- result:
+		case <-ctx.Done():
+		}
+		return nil
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("%s did not produce a valid %s result: %w", config.Source.Name, expectedPeriod, lastErr)
+	}
+	return fmt.Errorf("%s did not produce a valid %s result", config.Source.Name, expectedPeriod)
+}
+
+func validateOfficialValueFastPathResult(source Source, result *SnapshotResult, expectedPeriod string) error {
+	if source.Primary {
+		return validatePrimaryFastPathResult(result, expectedPeriod)
+	}
+	if result == nil {
+		return errors.New("missing value result")
+	}
+	if !source.ValueSource {
+		return fmt.Errorf("%s is not configured as a value source", source.Name)
+	}
+	if result.Source != source.Name {
+		return fmt.Errorf("source=%q, expected %q", result.Source, source.Name)
+	}
+	if result.URL != source.URL {
+		return fmt.Errorf("source URL=%q, expected %q", result.URL, source.URL)
+	}
+	if result.SourceType != source.SourceType {
+		return fmt.Errorf("source type=%q, expected %q", result.SourceType, source.SourceType)
+	}
+	return validateSnapshot(result, expectedPeriod)
+}
+
+func runPrimaryFastPath(client *http.Client, states map[string]*SourceResult, eventTime, pollEnd time.Time, expectedPeriod string, logger *log.Logger) (*SnapshotResult, error) {
+	state := ensureSourceState(states, primarySource)
+	var lastErr error
+	polls := 0
+
+	for time.Now().UTC().Before(pollEnd) {
+		pollStart := time.Now()
+		polls++
+
+		result, err := fetchAndParseWithTimeout(context.Background(), client, primarySource, primaryRequestTimeout, logger, false)
+		if err != nil {
+			lastErr = err
+			logger.Printf("%s primary poll failed: %v", primarySource.Name, err)
+			sleepAfterPoll(pollStart, primaryPollCadence)
+			continue
+		}
+
+		state.Mu.Lock()
+		baseline := state.Baseline
+		state.Latest = result
+		state.Mu.Unlock()
+
+		if !primaryContentChanged(result, baseline) {
+			sleepAfterPoll(pollStart, primaryPollCadence)
+			continue
+		}
+		if err := validatePrimaryFastPathResult(result, expectedPeriod); err != nil {
+			lastErr = err
+			logger.Printf("%s primary candidate rejected: %v", primarySource.Name, err)
+			sleepAfterPoll(pollStart, primaryPollCadence)
+			continue
+		}
+
+		result.DetectionMethod = "primary-content"
+		result.Timestamp = time.Now().UTC()
+		result.EventLatencyMs = result.Timestamp.Sub(eventTime).Milliseconds()
+		for i := range result.Measures {
+			result.Measures[i].Timestamp = result.Timestamp
+		}
+
+		state.Mu.Lock()
+		state.FirstHit = result
+		state.Detected = true
+		state.Mu.Unlock()
+
+		printUpdate(result, primarySource)
+		logger.Printf("%s primary fast path confirmed after %d polls latency_ms=%d", primarySource.Name, polls, result.EventLatencyMs)
+		return result, nil
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("primary source did not produce a valid %s result before poll window ended: %w", expectedPeriod, lastErr)
+	}
+	return nil, fmt.Errorf("primary source did not produce a valid %s result before poll window ended", expectedPeriod)
+}
+
+func primaryContentChanged(result *SnapshotResult, baseline *Baseline) bool {
+	if result == nil {
+		return false
+	}
+	if baseline == nil {
+		return true
+	}
+	return result.ContentHash != baseline.ContentHash ||
+		result.Period != baseline.Period ||
+		measureSignature(result.Measures) != baseline.Signature
+}
+
+func validatePrimaryFastPathResult(result *SnapshotResult, expectedPeriod string) error {
+	if result == nil {
+		return errors.New("missing primary result")
+	}
+	if result.Source != primarySource.Name {
+		return fmt.Errorf("source=%q, expected %q", result.Source, primarySource.Name)
+	}
+	if result.URL != tableURL {
+		return fmt.Errorf("source URL=%q, expected %q", result.URL, tableURL)
+	}
+	if result.SourceType != primarySource.SourceType {
+		return fmt.Errorf("source type=%q, expected %q", result.SourceType, primarySource.SourceType)
+	}
+	if result.Confidence != "HIGH" {
+		return fmt.Errorf("confidence=%q, expected HIGH", result.Confidence)
+	}
+	return validateSnapshot(result, expectedPeriod)
+}
+
+func runPostReleaseConfirmations(client *http.Client, states map[string]*SourceResult, primary *SnapshotResult, expectedPeriod string, logger *log.Logger) map[string]*SourceResult {
+	allConfirmationSources := []Source{primarySource, pdfSource, summarySource}
+	outcomes := make(chan ConfirmationOutcome, len(allConfirmationSources))
+	var wg sync.WaitGroup
+
+	for _, source := range allConfirmationSources {
+		if primary != nil && source.Name == primary.Source {
+			continue
+		}
+		source := source
+		state := ensureSourceState(states, source)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			outcomes <- pollConfirmationSource(client, source, state, primary, expectedPeriod, logger)
+		}()
+	}
+
+	wg.Wait()
+	close(outcomes)
+	for outcome := range outcomes {
+		printConfirmationOutcome(outcome)
+	}
+	return states
+}
+
+func pollConfirmationSource(client *http.Client, source Source, state *SourceResult, primary *SnapshotResult, expectedPeriod string, logger *log.Logger) ConfirmationOutcome {
+	deadline := time.Now().Add(confirmationTimeout)
+	var lastResult *SnapshotResult
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		pollStart := time.Now()
+		result, err := fetchAndParse(context.Background(), client, source, logger, false)
+		if err != nil {
+			lastErr = err
+			if result != nil {
+				lastResult = result
+				updateConfirmationState(state, result, false)
+			}
+			logger.Printf("%s confirmation poll failed: %v", source.Name, err)
+			sleepAfterPoll(pollStart, confirmationCadence)
+			continue
+		}
+
+		lastResult = result
+		outcome := classifyConfirmation(source, result, primary, expectedPeriod)
+		updateConfirmationState(state, result, outcome.Status == "CONFIRMED")
+		if outcome.Status != "NOT_UPDATED" {
+			return outcome
+		}
+		sleepAfterPoll(pollStart, confirmationCadence)
+	}
+
+	if lastResult != nil {
+		outcome := classifyConfirmation(source, lastResult, primary, expectedPeriod)
+		if outcome.Status == "NOT_UPDATED" {
+			outcome.Detail = "confirmation timeout expired before expected period appeared"
+		}
+		return outcome
+	}
+	if lastErr != nil {
+		return ConfirmationOutcome{Source: source.Name, Status: "ERROR", Detail: lastErr.Error()}
+	}
+	return ConfirmationOutcome{Source: source.Name, Status: "NOT_UPDATED", Detail: "confirmation timeout expired before any usable response"}
+}
+
+func classifyConfirmation(source Source, result, primary *SnapshotResult, expectedPeriod string) ConfirmationOutcome {
+	outcome := ConfirmationOutcome{
+		Source: source.Name,
+		Status: "ERROR",
+		Result: result,
+	}
+	if result != nil {
+		outcome.Period = result.Period
+		outcome.Values = measureSignature(result.Measures)
+	}
+	if result == nil {
+		outcome.Detail = "missing result"
+		return outcome
+	}
+	if result.Error != "" {
+		outcome.Detail = result.Error
+		return outcome
+	}
+	if expectedPeriod != "" && result.Period != expectedPeriod {
+		outcome.Status = "NOT_UPDATED"
+		outcome.Detail = fmt.Sprintf("period=%s expected=%s", result.Period, expectedPeriod)
+		return outcome
+	}
+	if !source.ValueSource {
+		if result.ReleaseConfirmed {
+			outcome.Status = "CONFIRMED"
+			outcome.Detail = "official release page reached expected period; value source not used"
+			return outcome
+		}
+		outcome.Status = "NOT_UPDATED"
+		outcome.Detail = "release page has not confirmed expected period"
+		return outcome
+	}
+	if err := validateSnapshot(result, expectedPeriod); err != nil {
+		outcome.Detail = err.Error()
+		return outcome
+	}
+	if primary == nil {
+		outcome.Detail = "missing selected official source result"
+		return outcome
+	}
+	if !sameMeasures(primary.Measures, result.Measures) {
+		outcome.Status = "MISMATCH"
+		outcome.Detail = fmt.Sprintf("selected=%s confirmation=%s", measureSignature(primary.Measures), measureSignature(result.Measures))
+		return outcome
+	}
+	outcome.Status = "CONFIRMED"
+	outcome.Detail = "values match selected official source"
+	return outcome
+}
+
+func updateConfirmationState(state *SourceResult, result *SnapshotResult, detected bool) {
+	if state == nil || result == nil {
+		return
+	}
+	state.Mu.Lock()
+	defer state.Mu.Unlock()
+	state.Latest = result
+	if detected && state.FirstHit == nil {
+		state.FirstHit = result
+		state.Detected = true
 	}
 }
 
-func sleepOrStop(stopCh <-chan struct{}, duration time.Duration) {
-	timer := time.NewTimer(duration)
+func ensureSourceState(states map[string]*SourceResult, source Source) *SourceResult {
+	state := states[source.Name]
+	if state == nil {
+		state = &SourceResult{Name: source.Name, Source: source}
+		states[source.Name] = state
+	}
+	return state
+}
+
+func sleepAfterPoll(start time.Time, cadence time.Duration) {
+	if remaining := cadence - time.Since(start); remaining > 0 {
+		time.Sleep(remaining)
+	}
+}
+
+func sleepAfterPollOrDone(ctx context.Context, start time.Time, cadence time.Duration) bool {
+	remaining := cadence - time.Since(start)
+	if remaining <= 0 {
+		return true
+	}
+	timer := time.NewTimer(remaining)
 	defer timer.Stop()
 	select {
-	case <-stopCh:
+	case <-ctx.Done():
+		return false
 	case <-timer.C:
+		return true
 	}
+}
+
+func printConfirmationOutcome(outcome ConfirmationOutcome) {
+	values := outcome.Values
+	if values == "" && outcome.Result != nil {
+		values = fmt.Sprintf("release_confirmed=%v", outcome.Result.ReleaseConfirmed)
+	}
+	fmt.Printf("[%s] %s | Period: %s | Values: %s | %s\n",
+		outcome.Source, outcome.Status, prettyPeriod(outcome.Period), trimForConsole(values, 120), trimForConsole(outcome.Detail, 160))
 }
 
 func printUpdate(result *SnapshotResult, source Source) {
@@ -1043,6 +1426,21 @@ func validateSnapshot(result *SnapshotResult, expectedPeriod string) error {
 
 	byName := map[string]MeasureResult{}
 	for _, measure := range result.Measures {
+		if _, exists := byName[measure.EventName]; exists {
+			return fmt.Errorf("duplicate event %q", measure.EventName)
+		}
+		if measure.Country != country {
+			return fmt.Errorf("%s country=%q, expected %q", measure.EventName, measure.Country, country)
+		}
+		if measure.Table != tableName {
+			return fmt.Errorf("%s table=%q, expected %q", measure.EventName, measure.Table, tableName)
+		}
+		if measure.Unit != unitPercent {
+			return fmt.Errorf("%s unit=%q, expected %q", measure.EventName, measure.Unit, unitPercent)
+		}
+		if measure.Period != result.Period {
+			return fmt.Errorf("%s event period=%s, source period=%s", measure.EventName, measure.Period, result.Period)
+		}
 		if measure.ValueMethod != valueMethod && measure.ValueMethod != pdfValueMethod {
 			return fmt.Errorf("%s value method=%q, expected official direct table/PDF value", measure.EventName, measure.ValueMethod)
 		}
@@ -1067,6 +1465,30 @@ func validateSnapshot(result *SnapshotResult, expectedPeriod string) error {
 		}
 		if measure.ItemCode != target.ItemCode {
 			return fmt.Errorf("%s item=%q, expected %q", target.EventName, measure.ItemCode, target.ItemCode)
+		}
+		if measure.Seasonality != target.Seasonality {
+			return fmt.Errorf("%s seasonality=%q, expected %q", target.EventName, measure.Seasonality, target.Seasonality)
+		}
+		switch target.ValueKind {
+		case ValueMoM:
+			if measure.Column != latestMoMColumnFromPeriod(result.Period) {
+				return fmt.Errorf("%s column=%q, expected %q", target.EventName, measure.Column, latestMoMColumnFromPeriod(result.Period))
+			}
+			if result.FromPeriod != "" && measure.FromPeriod != result.FromPeriod {
+				return fmt.Errorf("%s from_period=%q, expected %q", target.EventName, measure.FromPeriod, result.FromPeriod)
+			}
+			if measure.Previous == "" {
+				return fmt.Errorf("%s missing previous MoM value", target.EventName)
+			}
+		case ValueYoY:
+			if measure.Column != yoyColumnFromPeriod(result.Period) {
+				return fmt.Errorf("%s column=%q, expected %q", target.EventName, measure.Column, yoyColumnFromPeriod(result.Period))
+			}
+			if measure.FromPeriod != "" {
+				return fmt.Errorf("%s unexpected from_period=%q for YoY value", target.EventName, measure.FromPeriod)
+			}
+		default:
+			return fmt.Errorf("%s unknown target value kind=%q", target.EventName, target.ValueKind)
 		}
 	}
 	return nil
@@ -1185,11 +1607,25 @@ func table1Text(text string) (string, error) {
 	return text[start : start+endRel], nil
 }
 
-func parsePDFTargetRow(tableText string, target MeasureTarget, period, fromPeriod string) (ParsedRow, error) {
+func buildPDFTargetRowRegexes() map[string]*regexp.Regexp {
+	out := make(map[string]*regexp.Regexp)
+	for _, target := range uniqueRowTargets() {
+		out[rowKey(target.RowText, target.GroupCode, target.ItemCode)] = regexp.MustCompile(pdfTargetRowPattern(target))
+	}
+	return out
+}
+
+func pdfTargetRowPattern(target MeasureTarget) string {
 	labelPattern := flexibleLabelPattern(target.RowText)
-	pattern := `(?i)` + labelPattern + `\s*(?:\d+(?:\s*,\s*\d+)?)?\s*(?:\.\s*)*\b` +
+	return `(?i)` + labelPattern + `\s*(?:\d+(?:\s*,\s*\d+)?)?\s*(?:\.\s*)*\b` +
 		regexp.QuoteMeta(target.GroupCode) + `\s+` + regexp.QuoteMeta(target.ItemCode) + `\b`
-	re := regexp.MustCompile(pattern)
+}
+
+func parsePDFTargetRow(tableText string, target MeasureTarget, period, fromPeriod string) (ParsedRow, error) {
+	re := pdfTargetRowRegexes[rowKey(target.RowText, target.GroupCode, target.ItemCode)]
+	if re == nil {
+		re = regexp.MustCompile(pdfTargetRowPattern(target))
+	}
 	matches := re.FindAllStringIndex(tableText, -1)
 	if len(matches) != 1 {
 		return ParsedRow{}, fmt.Errorf("PDF Table 1 target row match count=%d for row=%q group=%s item=%s", len(matches), target.RowText, target.GroupCode, target.ItemCode)
@@ -1243,8 +1679,7 @@ func parseSummaryConfirmation(body []byte) (ParsedSnapshot, []string, error) {
 }
 
 func parseReleasePeriod(text string) string {
-	re := regexp.MustCompile(`(?i)\bPRODUCER PRICE INDEXES\s*[-–]\s*([A-Za-z]+)\s+(20\d{2})\b`)
-	match := re.FindStringSubmatch(text)
+	match := releasePeriodRe.FindStringSubmatch(text)
 	if len(match) == 3 {
 		return fmt.Sprintf("%s-%02d", match[2], monthNumber(match[1]))
 	}
@@ -1271,8 +1706,7 @@ func extractPDFText(body []byte) (string, []string) {
 	}
 
 	var warnings []string
-	streamRe := regexp.MustCompile(`(?s)<<(.*?)>>\s*stream\r?\n(.*?)\r?\nendstream`)
-	streams := streamRe.FindAllSubmatch(body, -1)
+	streams := pdfStreamRe.FindAllSubmatch(body, -1)
 	var parts []string
 	for _, stream := range streams {
 		dict := string(stream[1])
@@ -1303,13 +1737,11 @@ func pdfContentText(data []byte) string {
 	s := string(data)
 	var parts []string
 
-	literalRe := regexp.MustCompile(`\((?:\\.|[^\\()])*\)`)
-	for _, token := range literalRe.FindAllString(s, -1) {
+	for _, token := range pdfLiteralRe.FindAllString(s, -1) {
 		parts = append(parts, decodePDFLiteral(token[1:len(token)-1]))
 	}
 
-	hexRe := regexp.MustCompile(`<([0-9A-Fa-f\s]+)>`)
-	for _, match := range hexRe.FindAllStringSubmatch(s, -1) {
+	for _, match := range pdfHexRe.FindAllStringSubmatch(s, -1) {
 		raw := strings.Join(strings.Fields(match[1]), "")
 		if len(raw)%2 != 0 {
 			raw += "0"
@@ -1377,8 +1809,7 @@ func normalizePDFText(s string) string {
 }
 
 func numbersFromText(s string) []float64 {
-	re := regexp.MustCompile(`[-+]?\d[\d,]*(?:\.\d+)?`)
-	raw := re.FindAllString(s, -1)
+	raw := numberRe.FindAllString(s, -1)
 	values := make([]float64, 0, len(raw))
 	for _, item := range raw {
 		value, err := strconv.ParseFloat(strings.ReplaceAll(item, ",", ""), 64)
@@ -1550,12 +1981,10 @@ func rowKey(rowText, groupCode, itemCode string) string {
 }
 
 func htmlRows(doc string) [][]string {
-	rowRe := regexp.MustCompile(`(?is)<tr\b[^>]*>(.*?)</tr>`)
-	cellRe := regexp.MustCompile(`(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>`)
-	rowMatches := rowRe.FindAllStringSubmatch(doc, -1)
+	rowMatches := htmlRowRe.FindAllStringSubmatch(doc, -1)
 	rows := make([][]string, 0, len(rowMatches))
 	for _, rowMatch := range rowMatches {
-		cellMatches := cellRe.FindAllStringSubmatch(rowMatch[1], -1)
+		cellMatches := htmlCellRe.FindAllStringSubmatch(rowMatch[1], -1)
 		if len(cellMatches) == 0 {
 			continue
 		}
@@ -1581,8 +2010,7 @@ func numbersFromCells(cells []string) []float64 {
 func parseNumber(s string) (float64, bool) {
 	clean := strings.ReplaceAll(s, "\u2212", "-")
 	clean = strings.ReplaceAll(clean, "%", "")
-	re := regexp.MustCompile(`[-+]?\d[\d,]*(?:\.\d+)?`)
-	match := re.FindString(clean)
+	match := numberRe.FindString(clean)
 	if match == "" {
 		return 0, false
 	}
@@ -1591,14 +2019,10 @@ func parseNumber(s string) (float64, bool) {
 }
 
 func stripHTML(s string) string {
-	scriptRe := regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`)
-	styleRe := regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`)
-	breakRe := regexp.MustCompile(`(?i)<\s*(br|/p|/tr|/th|/td|/li|/div)\b[^>]*>`)
-	tagRe := regexp.MustCompile(`(?s)<[^>]+>`)
-	s = scriptRe.ReplaceAllString(s, " ")
-	s = styleRe.ReplaceAllString(s, " ")
-	s = breakRe.ReplaceAllString(s, "\n")
-	s = tagRe.ReplaceAllString(s, " ")
+	s = htmlScriptRe.ReplaceAllString(s, " ")
+	s = htmlStyleRe.ReplaceAllString(s, " ")
+	s = htmlBreakRe.ReplaceAllString(s, "\n")
+	s = htmlTagRe.ReplaceAllString(s, " ")
 	return html.UnescapeString(s)
 }
 
@@ -1607,7 +2031,7 @@ func normalizeSpace(s string) string {
 }
 
 func stripTrailingFootnote(label string) string {
-	return strings.TrimSpace(regexp.MustCompile(`\s*\(\s*\d+\s*\)\s*$`).ReplaceAllString(normalizeSpace(label), ""))
+	return strings.TrimSpace(trailingFootnoteRe.ReplaceAllString(normalizeSpace(label), ""))
 }
 
 func normalizeLabel(label string) string {
@@ -1628,8 +2052,7 @@ func parseLatestPeriod(s string) string {
 }
 
 func parseMResultsPeriod(s string) string {
-	re := regexp.MustCompile(`(?i)\b(20\d{2})\s+M(0[1-9]|1[0-2])\s+Results\b`)
-	match := re.FindStringSubmatch(s)
+	match := mResultsPeriodRe.FindStringSubmatch(s)
 	if len(match) == 3 {
 		return match[1] + "-" + match[2]
 	}
@@ -1637,8 +2060,7 @@ func parseMResultsPeriod(s string) string {
 }
 
 func parseTableCaptionPeriod(s string) string {
-	re := regexp.MustCompile(`(?i)\[\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\s*\]`)
-	match := re.FindStringSubmatch(s)
+	match := tableCaptionPeriodRe.FindStringSubmatch(s)
 	if len(match) == 3 {
 		return fmt.Sprintf("%s-%02d", match[2], monthNumber(match[1]))
 	}
@@ -1646,8 +2068,7 @@ func parseTableCaptionPeriod(s string) string {
 }
 
 func parseLatestMonthYearPeriod(s string) string {
-	re := regexp.MustCompile(`(?i)\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b`)
-	matches := re.FindAllStringSubmatch(s, -1)
+	matches := latestMonthYearPeriodRe.FindAllStringSubmatch(s, -1)
 	if len(matches) == 0 {
 		return ""
 	}
@@ -1655,34 +2076,38 @@ func parseLatestMonthYearPeriod(s string) string {
 	return fmt.Sprintf("%s-%02d", match[2], monthNumber(match[1]))
 }
 
-func validateConfiguredSchedule(client *http.Client, eventTime time.Time, logger *log.Logger) string {
+func validateConfiguredSchedule(client *http.Client, eventTime time.Time, logger *log.Logger) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, scheduleURL, nil)
 	if err != nil {
-		return "could not create BLS PPI schedule request"
+		return "could not create BLS PPI schedule request", nil
 	}
 	setHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
-		return "BLS PPI schedule validation unavailable: " + err.Error()
+		return "BLS PPI schedule validation unavailable: " + err.Error(), nil
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "BLS PPI schedule validation unavailable: status=" + resp.Status, nil
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "BLS PPI schedule validation read failed"
+		return "BLS PPI schedule validation read failed", nil
 	}
 
 	schedule, err := parsePPISchedule(normalizeSpace(stripHTML(string(body))), expectedReleasePeriod(eventTime))
 	if err != nil {
-		return "BLS PPI schedule row not parsed"
+		return "BLS PPI schedule row not parsed", nil
 	}
 	if !schedule.Equal(eventTime) {
 		logger.Printf("BLS PPI schedule release time=%s configured=%s", schedule.UTC().Format(time.RFC3339), eventTime.UTC().Format(time.RFC3339))
-		return fmt.Sprintf("configured eventTimeUTC differs from BLS PPI schedule (%s UTC)", schedule.UTC().Format("2006-01-02 15:04:05"))
+		return "", fmt.Errorf("configured event time differs from BLS PPI schedule: configured=%s UTC schedule=%s UTC",
+			eventTime.UTC().Format(eventTimeLayout), schedule.UTC().Format(eventTimeLayout))
 	}
-	return ""
+	return "", nil
 }
 
 func parsePPISchedule(text, referencePeriod string) (time.Time, error) {
